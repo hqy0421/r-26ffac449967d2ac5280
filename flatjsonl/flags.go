@@ -28,6 +28,15 @@ type Flags struct {
 	Parquet            string
 	ParquetCompression string
 
+	// ParquetPlan freezes a partition-wide Parquet column plan. When the file
+	// does not exist, it is created after the key scan (plan mode); when it
+	// exists, its columns and types are used as-is for every hourly output
+	// (write mode).
+	ParquetPlan string
+	// UnknownFields adds reserved columns to a frozen plan that capture fields
+	// absent from the plan together with a pointer back to the source row.
+	UnknownFields bool
+
 	DuckDB string
 
 	SQLite         string
@@ -81,6 +90,11 @@ func (f *Flags) Register() {
 	flag.StringVar(&f.Parquet, "parquet", "", "Output to Parquet file.")
 	flag.StringVar(&f.ParquetCompression, "parquet-compression", "snappy",
 		"Parquet column compression: snappy, zstd, gzip, none.")
+	flag.StringVar(&f.ParquetPlan, "parquet-plan", "",
+		"Path to frozen Parquet column plan file for partitioned (hourly) writes. "+
+			"The file is created from the key scan when missing, otherwise its column order and types are used as-is.")
+	flag.BoolVar(&f.UnknownFields, "unknown-fields", false,
+		"With -parquet-plan, reserve ._unknown_fields and ._unknown_source columns for data not covered by the frozen plan.")
 	flag.StringVar(&f.DuckDB, "duck-db", "", "Output to DuckDB database file via DuckDB CLI.")
 
 	flag.StringVar(&f.SQLite, "sqlite", "", "Output to SQLite file.")

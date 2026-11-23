@@ -3,3 +3,5 @@
 /*.raw
 /*.gz
 /*.pg.sql
+/*.parquet
+/frozen_plan.json

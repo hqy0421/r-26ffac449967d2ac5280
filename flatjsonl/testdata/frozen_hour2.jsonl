@@ -1,0 +1,2 @@
+{"id": 3, "name": "gamma", "score": 30.5, "active": true, "new_field": "surprise", "nested": {"deep": 7}}
+{"id": 4, "name": "delta", "score": 40, "active": false}

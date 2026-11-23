@@ -319,6 +319,43 @@ Export the same input to Parquet with Snappy compression.
 flatjsonl -parquet report.parquet -parquet-compression snappy -config events.json events.jsonl
 ```
 
+### Frozen Parquet plan for hourly partitions
+
+When a repository is converted to JSONL hour by hour, later files may introduce
+new fields or turn integer columns into exactly representable decimals. Writing
+each hour independently would produce incompatible Parquet schemas. A frozen
+column plan makes every hourly file use the same column order and physical
+types, so the files can be concatenated without schema reconciliation.
+
+The plan file is created by the first run (the planning scan) and reused by all
+later hourly runs against the same path.
+
+```
+# First run (or any run before the plan exists): scan and freeze the plan.
+flatjsonl -parquet hour=00.parquet -parquet-plan partition.plan.json -unknown-fields hour=00.jsonl
+
+# Every later hour writes strictly against the frozen plan.
+flatjsonl -parquet hour=01.parquet -parquet-plan partition.plan.json -unknown-fields hour=01.jsonl
+```
+
+Properties of the plan:
+
+* columns and their scalar types (`int`, `float`, `bool`, `string`, `json`) are
+  frozen once, a column planned as `int` keeps `INT64` even when a later hour
+  contains decimals (the fractional part does not fit, matching historical
+  behavior), while a column planned as `float` stays `DOUBLE` in hours that only
+  contain integers;
+* hours with no rows (missing or empty input) still produce a readable Parquet
+  file containing only the frozen schema;
+* with `-unknown-fields`, fields not covered by the plan are not dropped: their
+  original JSON values are collected in a `._unknown_fields` JSON column and
+  `._unknown_source` stores an `input:line` locator pointing back to the source
+  row, preserving full precision of integers that do not fit a float;
+* the plan records whether `-add-sequence` and `-unknown-fields` were used, runs
+  that deviate fail instead of silently changing the schema;
+* transpose output can not be combined with a frozen plan because transposed
+  tables derive their columns from per-hour data.
+
 Show flat list of keys found in first 100 (or less) lines of `events.jsonl`.
 ```
 flatjsonl -max-lines 100 -show-keys-flat events.jsonl

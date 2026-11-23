@@ -49,6 +49,18 @@ type Processor struct {
 	// keys are ordered by replaced column names, indexes match values of includeKeys.
 	keys []flKey
 
+	// frozenPlan is the partition-wide Parquet column plan loaded from
+	// -parquet-plan, nil when the feature is not used.
+	frozenPlan *FrozenPlan
+	// frozenPlanWrite indicates that the plan file already existed and the
+	// current run must write hourly outputs strictly against it.
+	frozenPlanWrite bool
+	// unknownIndexes maps a flat key hash to the value indexes of the
+	// reserved unknown-field columns (fields and source locator); -1 means
+	// the feature is disabled for this run.
+	unknownFieldsIndex int
+	unknownSourceIndex int
+
 	flKeys                *xsync.Map[uint64, flKey]
 	parentCardinality     map[uint64]int
 	parentHighCardinality *xsync.Map[uint64, bool]
@@ -150,6 +162,9 @@ func NewProcessor(f Flags, cfg Config, inputs ...Input) (*Processor, error) { //
 		flKeys:                xsync.NewMap[uint64, flKey](),
 		parentHighCardinality: xsync.NewMap[uint64, bool](),
 		parentCardinality:     map[uint64]int{},
+
+		unknownFieldsIndex: -1,
+		unknownSourceIndex: -1,
 	}
 
 	p.rd.Processor = p
@@ -278,10 +293,24 @@ func (p *Processor) Process() error {
 		if i.FileName != "" {
 			fi, err := os.Stat(i.FileName)
 			if err != nil {
+				if p.frozenPlanMode() && os.IsNotExist(err) {
+					// An hourly input may be missing entirely; the hour still
+					// gets a schema-only Parquet file.
+					p.Log("missing input skipped for frozen plan run: " + i.FileName)
+
+					continue
+				}
+
 				return fmt.Errorf("stat %s: %w", i.FileName, err)
 			}
 
 			if fi.Size() == 0 {
+				if p.frozenPlanMode() {
+					p.Log("empty input skipped for frozen plan run: " + i.FileName)
+
+					continue
+				}
+
 				return fmt.Errorf("%s: %w", i.FileName, errEmptyFile)
 			}
 
@@ -304,32 +333,14 @@ func (p *Processor) Process() error {
 
 // PrepareKeys runs first pass of reading if necessary to scan the keys.
 func (p *Processor) PrepareKeys() error {
+	if p.f.ParquetPlan != "" {
+		return p.prepareFrozenPlanKeys()
+	}
+
 	if len(p.includeRegex) == 0 && len(p.cfg.IncludeKeys) > 0 {
 		p.iterateIncludeKeys()
 	} else {
-		p.pr.Reset()
-
-		p.pr.AddMetrics(progress.Metric{
-			Name: "keys approx", Type: progress.Gauge,
-			Value: func() int64 { return atomic.LoadInt64(&p.totalKeys) },
-		})
-
-		p.pr.AddMetrics(progress.Metric{
-			Name: "rows in progress", Type: progress.Gauge,
-			Value: func() int64 { return atomic.LoadInt64(&p.inProgress) },
-		})
-
-		p.pr.AddMetrics(progress.Metric{
-			Name: "errors", Type: progress.Gauge,
-			Value: func() int64 { return atomic.LoadInt64(&p.errors) },
-		})
-
-		p.pr.AddMetrics(progress.Metric{
-			Name: "throttling", Type: progress.Gauge,
-			Value: func() int64 { return atomic.LoadInt64(&p.throttle) },
-		})
-
-		atomic.StoreInt64(&p.errors, 0)
+		p.resetKeyScanProgress()
 
 		// Scan available keys.
 		if err := p.scanAvailableKeys(); err != nil {
@@ -343,6 +354,33 @@ func (p *Processor) PrepareKeys() error {
 	p.prepareKeys()
 
 	return nil
+}
+
+// resetKeyScanProgress initializes progress metrics for the key scan pass.
+func (p *Processor) resetKeyScanProgress() {
+	p.pr.Reset()
+
+	p.pr.AddMetrics(progress.Metric{
+		Name: "keys approx", Type: progress.Gauge,
+		Value: func() int64 { return atomic.LoadInt64(&p.totalKeys) },
+	})
+
+	p.pr.AddMetrics(progress.Metric{
+		Name: "rows in progress", Type: progress.Gauge,
+		Value: func() int64 { return atomic.LoadInt64(&p.inProgress) },
+	})
+
+	p.pr.AddMetrics(progress.Metric{
+		Name: "errors", Type: progress.Gauge,
+		Value: func() int64 { return atomic.LoadInt64(&p.errors) },
+	})
+
+	p.pr.AddMetrics(progress.Metric{
+		Name: "throttling", Type: progress.Gauge,
+		Value: func() int64 { return atomic.LoadInt64(&p.throttle) },
+	})
+
+	atomic.StoreInt64(&p.errors, 0)
 }
 
 // WriteOutput runs second pass of reading to create the output.
@@ -600,12 +638,23 @@ func (p *Processor) iterateForWriters() error {
 				continue
 			}
 
+			if p.frozenPlanWrite && errors.Is(err, os.ErrNotExist) {
+				p.Log("missing input skipped for frozen plan run: " + input.FileName)
+
+				continue
+			}
+
 			return err
 		}
 
 		sess.lineStarted = wi.lineStarted
 		sess.setupWalker = wi.setupWalker
 		sess.lineFinished = wi.lineFinished
+
+		wi.inputName = input.FileName
+		if wi.inputName == "" {
+			wi.inputName = "<stdin>"
+		}
 
 		err = p.rd.Read(sess)
 		if err != nil {
@@ -623,6 +672,9 @@ func (p *Processor) iterateForWriters() error {
 type lineBuf struct {
 	h      *hasher
 	values []Value
+
+	// unknown accumulates flat fields that are not part of a frozen plan.
+	unknown map[string]unknownFieldEntry
 }
 
 func newWriteIterator(p *Processor, pkIndex map[uint64]int, pkDst map[uint64]string, pkTimeFmt map[uint64]string) *writeIterator {
@@ -652,6 +704,12 @@ func newWriteIterator(p *Processor, pkIndex map[uint64]int, pkDst map[uint64]str
 	wi.p = p
 	wi.fieldLimit = p.f.FieldLimit
 	wi.outTimeFmt = p.cfg.OutputTimeFormat
+
+	if p.frozenPlan != nil && p.f.UnknownFields {
+		wi.captureUnknown = true
+		wi.unknownKeyIdx = p.unknownFieldsIndex
+		wi.sourceKeyIdx = p.unknownSourceIndex
+	}
 
 	if wi.outTimeFmt == "" {
 		wi.outTimeFmt = time.RFC3339
@@ -723,6 +781,12 @@ type writeIterator struct {
 	outTimeFmt string
 	outputTZ   *time.Location
 
+	// Frozen plan unknown-field capture.
+	captureUnknown bool
+	unknownKeyIdx  int
+	sourceKeyIdx   int
+	inputName      string
+
 	// Read-write under concurrency.
 	lineBufPool sync.Pool
 	seqExpected int64
@@ -757,7 +821,14 @@ func (wi *writeIterator) setupWalker(w *FastWalker) {
 		wi.setValue(Value{
 			Type:   TypeString,
 			String: string(value),
-		}, pk, l)
+		}, pk, l, string(flatPath), func() json.RawMessage {
+			b, err := json.Marshal(string(value))
+			if err != nil {
+				panic(fmt.Sprintf("BUG: marshal string value: %v", err))
+			}
+
+			return b
+		}())
 
 		return k.extractors
 	}
@@ -769,16 +840,21 @@ func (wi *writeIterator) setupWalker(w *FastWalker) {
 			Type:      TypeFloat,
 			Number:    value,
 			RawNumber: string(raw),
-		}, pk, l)
+		}, pk, l, string(flatPath), json.RawMessage(raw))
 	}
 	w.FnBool = func(seq int64, flatPath []byte, pl int, _ []string, value bool) {
 		l, _ := wi.pending.Load(seq)
 		pk := l.h.hashBytes(flatPath)
 
+		raw := "false"
+		if value {
+			raw = "true"
+		}
+
 		wi.setValue(Value{
 			Type: TypeBool,
 			Bool: value,
-		}, pk, l)
+		}, pk, l, string(flatPath), json.RawMessage(raw))
 	}
 	w.FnNull = func(seq int64, flatPath []byte, pl int, _ []string) {
 		l, _ := wi.pending.Load(seq)
@@ -786,17 +862,21 @@ func (wi *writeIterator) setupWalker(w *FastWalker) {
 
 		wi.setValue(Value{
 			Type: TypeNull,
-		}, pk, l)
+		}, pk, l, string(flatPath), json.RawMessage("null"))
 	}
 }
 
-func (wi *writeIterator) setValue(v Value, pk uint64, l *lineBuf) {
+func (wi *writeIterator) setValue(v Value, pk uint64, l *lineBuf, flatPath string, raw json.RawMessage) {
 	if wi.singleKeyHash != 0 && pk != wi.singleKeyHash {
 		return
 	}
 
 	i, ok := wi.pkIndex[pk]
 	if !ok {
+		if wi.captureUnknown && !isFrozenReservedPath(flatPath) {
+			wi.captureUnknownValue(l, flatPath, v, raw)
+		}
+
 		return
 	}
 
@@ -866,6 +946,7 @@ func (wi *writeIterator) lineStarted(seq int64) error {
 	atomic.AddInt64(&wi.inProgress, 1)
 
 	l := wi.lineBufPool.Get().(*lineBuf) //nolint: errcheck
+	l.unknown = nil
 	wi.pending.Store(seq, l)
 
 	return nil
@@ -908,6 +989,10 @@ func (wi *writeIterator) complete(seq int64, l *lineBuf) error {
 		}
 
 		l.values[i] = val
+	}
+
+	if err := wi.flushUnknownFields(seq, l); err != nil {
+		return err
 	}
 
 	err := wi.p.w.ReceiveRow(seq, l.values)
